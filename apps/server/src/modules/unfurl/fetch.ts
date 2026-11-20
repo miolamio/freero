@@ -64,6 +64,8 @@ export function isBlockedAddress(ip: string): boolean {
       (first & 0xffc0) === 0xfec0 || // site-local (deprecated)
       (first & 0xff00) === 0xff00 || // multicast
       v.startsWith('64:ff9b:') || // NAT64 (can reach IPv4 private space)
+      first === 0x2002 || // 6to4 2002::/16 (embeds an IPv4 address, relayed to it)
+      /^2001:(0{1,4})?:/.test(v) || // Teredo 2001::/32 (embeds a server and client IPv4 address)
       v.startsWith('2001:db8:') || // documentation
       v.startsWith('100::') // discard
     );
@@ -148,7 +150,7 @@ export interface FetchOptions {
   testNetwork?: { resolve: Resolver; isBlocked(ip: string): boolean; port: number };
 }
 
-function requestOnce(url: URL, opts: FetchOptions, deadline: number, lookup: ReturnType<typeof guardedLookup>): Promise<{ res: http.IncomingMessage; req: http.ClientRequest }> {
+function requestOnce(url: URL, opts: FetchOptions, deadline: number, lookup: ReturnType<typeof guardedLookup>, inFlight: { req: http.ClientRequest | null }): Promise<{ res: http.IncomingMessage; req: http.ClientRequest }> {
   return new Promise((resolve, reject) => {
     const mod = url.protocol === 'https:' ? https : http;
     const req = mod.request(
@@ -162,6 +164,7 @@ function requestOnce(url: URL, opts: FetchOptions, deadline: number, lookup: Ret
       },
       (res) => resolve({ res, req }),
     );
+    inFlight.req = req;
     req.on('timeout', () => req.destroy(new UnfurlError('The site took too long to answer.', 'timeout')));
     req.on('error', reject);
     req.end();
@@ -171,11 +174,25 @@ function requestOnce(url: URL, opts: FetchOptions, deadline: number, lookup: Ret
 /** GET with the protections above; follows (and re-checks) redirects. */
 export async function safeFetch(raw: string, opts: FetchOptions): Promise<Fetched> {
   const deadline = Date.now() + opts.timeoutMs;
+  // One timer for the whole call — connecting, waiting for headers, every redirect, the body — that
+  // destroys whichever request is in flight. (The socket timeout alone restarts on every byte, so a
+  // server dripping headers could hold the call open.)
+  const inFlight: { req: http.ClientRequest | null } = { req: null };
+  const timer = setTimeout(() => inFlight.req?.destroy(new UnfurlError('The site took too long to answer.', 'timeout')), opts.timeoutMs);
+  try {
+    return await fetchHops(raw, opts, deadline, inFlight);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchHops(raw: string, opts: FetchOptions, deadline: number, inFlight: { req: http.ClientRequest | null }): Promise<Fetched> {
   const isBlocked = opts.testNetwork?.isBlocked ?? isBlockedAddress;
   const lookup = guardedLookup(opts.testNetwork?.resolve ?? dnsResolver, isBlocked);
   let url = checkUrl(raw, isBlocked, opts.protocols);
   for (let hop = 0; ; hop++) {
-    const { res, req } = await requestOnce(url, opts, deadline, lookup);
+    if (Date.now() >= deadline) throw new UnfurlError('The site took too long to answer.', 'timeout');
+    const { res, req } = await requestOnce(url, opts, deadline, lookup, inFlight);
     const status = res.statusCode ?? 0;
     if (status >= 300 && status < 400 && res.headers.location) {
       res.resume();
@@ -196,7 +213,6 @@ export async function safeFetch(raw: string, opts: FetchOptions): Promise<Fetche
     const chunks: Buffer[] = [];
     let size = 0;
     let truncated = false;
-    const timer = setTimeout(() => req.destroy(new UnfurlError('The site took too long to answer.', 'timeout')), Math.max(1, deadline - Date.now()));
     try {
       await new Promise<void>((resolve, reject) => {
         res.on('data', (chunk: Buffer) => {
@@ -220,7 +236,6 @@ export async function safeFetch(raw: string, opts: FetchOptions): Promise<Fetche
         req.on('error', reject);
       });
     } finally {
-      clearTimeout(timer);
       if (!res.destroyed) res.destroy();
     }
     return { url: url.toString(), status, contentType: String(res.headers['content-type'] ?? '').toLowerCase(), cacheControl: String(res.headers['cache-control'] ?? ''), body: Buffer.concat(chunks), truncated };
