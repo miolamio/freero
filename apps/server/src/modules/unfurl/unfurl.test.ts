@@ -59,8 +59,25 @@ describe('reading a page preview', () => {
     });
   });
 
+  it('keeps later tags when one has a stray apostrophe in an unquoted value', () => {
+    const meta = parseMeta("<head><meta name=author content=Don't><meta property=\"og:title\" content=\"T\"></head>", 'https://example.com/');
+    expect(meta.title).toBe('T');
+  });
+
   it('never returns a script URL as the preview image', () => {
     const meta = parseMeta('<head><meta property="og:image" content="javascript:alert(1)"></head>', 'https://example.com/');
     expect(meta.image).toBeNull();
+  });
+
+  it('reads a 200 KB page of unclosed tags in milliseconds, not seconds (it must not stall the server), and still finds a tag after quoted ">"', () => {
+    const started = performance.now();
+    parseMeta('<meta '.repeat(33_000), 'https://example.com/');
+    parseMeta('<title '.repeat(28_000), 'https://example.com/');
+    parseMeta('<meta "'.repeat(28_000), 'https://example.com/');
+    parseMeta('<meta \'>'.repeat(28_000) + '"', 'https://example.com/');
+    parseMeta('<meta x>'.repeat(25_000) + '"', 'https://example.com/');
+    expect(performance.now() - started).toBeLessThan(500);
+    const meta = parseMeta('<head><meta name="x" content="a > b"><meta property="og:title" content="T"></head>', 'https://example.com/');
+    expect(meta.title).toBe('T');
   });
 });
