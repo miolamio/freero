@@ -1,4 +1,4 @@
-// The only writer of oauth_clients, oauth_grants, oauth_codes, api_tokens, api_workspace_settings
+// The only writer of oauth_clients, oauth_grants, oauth_codes, oauth_redeemed_codes, api_tokens, api_workspace_settings
 // and api_workspace_credentials [S4].
 import { one, query, tx } from '../../platform/db';
 import { appendOutbox } from '../../platform/outbox';
@@ -460,13 +460,58 @@ export async function takeCode(codeHash: string): Promise<CodeRow | null> {
     : null;
 }
 
+/** Records that `codeHash` produced tokens, so the same code shown again can be recognised. */
+export async function recordRedeemedCode(codeHash: string, c: CodeRow, redeemedAt: number): Promise<void> {
+  await query(
+    `INSERT INTO oauth_redeemed_codes (code_hash, client_id, user_id, redirect_uri, scopes, resource, code_challenge, issued_via, redeemed_at, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
+    [codeHash, c.clientId, c.userId, c.redirectUri, c.scopes.join(' '), c.resource, c.codeChallenge, c.issuedVia, new Date(redeemedAt), new Date(c.expiresAt)],
+  );
+}
+
+/** A code that already produced tokens, and when; null for any other code. */
+export async function redeemedCodeOf(codeHash: string): Promise<{ code: CodeRow; redeemedAt: number } | null> {
+  const r = await one<{ client_id: string; user_id: string; redirect_uri: string; scopes: string; resource: string; code_challenge: string; issued_via: string; redeemed_at: Date; expires_at: Date }>(
+    `SELECT * FROM oauth_redeemed_codes WHERE code_hash = $1`,
+    [codeHash],
+  );
+  if (!r) return null;
+  return {
+    redeemedAt: r.redeemed_at.getTime(),
+    code: {
+      clientId: r.client_id,
+      userId: r.user_id,
+      redirectUri: r.redirect_uri,
+      scopes: splitScopes(r.scopes),
+      resource: r.resource,
+      codeChallenge: r.code_challenge,
+      issuedVia: r.issued_via,
+      expiresAt: r.expires_at.getTime(),
+    },
+  };
+}
+
+/** Whether the app has used a refresh token of its consent since `at` (it moved on from its first response). */
+export async function refreshUsedSince(clientId: string, userId: string, at: number): Promise<boolean> {
+  return (
+    (
+      await query(
+        `SELECT 1 FROM api_tokens t JOIN oauth_grants g ON g.id = t.grant_id
+         WHERE g.client_id = $1 AND g.user_id = $2 AND t.kind = 'refresh' AND t.used_at >= $3 LIMIT 1`,
+        [clientId, userId, new Date(at)],
+      )
+    ).length > 0
+  );
+}
+
 /** Expired codes and tokens (refresh tokens: also used ones past their life). */
 export async function deleteExpired(now: number): Promise<number> {
   const codes = await query(`DELETE FROM oauth_codes WHERE expires_at < $1 RETURNING code_hash`, [new Date(now)]);
+  const redeemed = await query(`DELETE FROM oauth_redeemed_codes WHERE expires_at < $1 RETURNING code_hash`, [new Date(now)]);
   const tokens = await query(`DELETE FROM api_tokens WHERE expires_at < $1 RETURNING id`, [new Date(now)]);
   const embeds = await query(`DELETE FROM api_embed_tokens WHERE expires_at < $1 RETURNING id`, [new Date(now)]);
   const exports = await query(`DELETE FROM api_export_tickets WHERE expires_at < $1 RETURNING id`, [new Date(now)]);
-  return codes.length + tokens.length + embeds.length + exports.length;
+  return codes.length + redeemed.length + tokens.length + embeds.length + exports.length;
 }
 
 // ---- live board views (MCP Apps, KAI-171) ----

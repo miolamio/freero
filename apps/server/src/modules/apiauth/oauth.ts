@@ -438,27 +438,60 @@ async function rotateRefreshToken(client: repo.ClientRow, presented: string, ask
 
 const s256 = (verifier: string) => createHash('sha256').update(verifier).digest('base64url');
 
+/** The checks every presentation of a code passes: redirect_uri, and PKCE (or the secret, for a code issued without it). */
+function checkCodeProof(client: repo.ClientRow, code: repo.CodeRow, body: Record<string, unknown>): void {
+  if (body.redirect_uri !== undefined && body.redirect_uri !== code.redirectUri) throw new OAuthError('invalid_grant', 'redirect_uri does not match the authorization request');
+  if (code.codeChallenge === '') {
+    // Issued without PKCE (a confidential client): its secret was checked above; a verifier now would be a downgrade.
+    if (client.secretHash === null || body.code_verifier !== undefined) throw new OAuthError('invalid_grant', 'PKCE verification failed');
+  } else {
+    const verifier = typeof body.code_verifier === 'string' ? body.code_verifier : '';
+    if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || !safeEqual(s256(verifier), code.codeChallenge)) throw new OAuthError('invalid_grant', 'PKCE verification failed');
+  }
+}
+
+/**
+ * A code that already produced tokens is shown again. Like a refresh token shown again (see
+ * rotateRefreshToken), it is the app retrying when it presents the code's own proof (PKCE verifier or
+ * secret) within REFRESH_RETRY_WINDOW_MS and has not used what it got: it is answered with a fresh
+ * pair (the lost response's tokens are of no use to anyone else). Showing it with the proof any
+ * other time means a copy exists, and the consent and every token under it end (RFC 6749 §4.1.2).
+ * Without the proof, or from another client, it is a plain refusal that changes nothing: whoever
+ * only learned the code can neither get tokens nor end the app's access.
+ * Returns the code to answer again, or null to refuse.
+ */
+async function reusedCode(client: repo.ClientRow, codeHash: string, body: Record<string, unknown>, now: number): Promise<repo.CodeRow | null> {
+  const used = await repo.redeemedCodeOf(codeHash);
+  if (!used || used.code.clientId !== client.id) return null;
+  try {
+    checkCodeProof(client, used.code, body);
+  } catch {
+    return null;
+  }
+  if (now - used.redeemedAt < REFRESH_RETRY_WINDOW_MS && !(await repo.refreshUsedSince(client.id, used.code.userId, used.redeemedAt))) return used.code;
+  const grant = await repo.deleteGrant(used.code.userId, client.id);
+  if (grant)
+    await recordAuditQuietly({ action: 'api.app_revoked', accountId: used.code.userId, actorId: null, target: { type: 'oauth_app', id: client.id, label: client.name }, metadata: { reason: 'authorization_code_reused' } });
+  return null;
+}
+
 /** POST /api/oauth/token: authorization_code (with PKCE) or refresh_token (rotating). */
 export async function tokenRequest(req: Request, body: Record<string, unknown>) {
   const client = await authenticateClient(req, body);
   const now = Date.now();
   if (body.grant_type === 'authorization_code') {
-    const code = typeof body.code === 'string' ? await repo.takeCode(hashSecret(body.code)) : null;
+    const codeHash = typeof body.code === 'string' ? hashSecret(body.code) : '';
+    const code = (codeHash ? await repo.takeCode(codeHash) : null) ?? (codeHash ? await reusedCode(client, codeHash, body, now) : null);
     if (!code || code.expiresAt <= now || code.clientId !== client.id) throw new OAuthError('invalid_grant', 'The code is invalid, expired or already used');
-    if (body.redirect_uri !== undefined && body.redirect_uri !== code.redirectUri) throw new OAuthError('invalid_grant', 'redirect_uri does not match the authorization request');
-    if (code.codeChallenge === '') {
-      // Issued without PKCE (a confidential client): its secret was checked above; a verifier now would be a downgrade.
-      if (client.secretHash === null || body.code_verifier !== undefined) throw new OAuthError('invalid_grant', 'PKCE verification failed');
-    } else {
-      const verifier = typeof body.code_verifier === 'string' ? body.code_verifier : '';
-      if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || !safeEqual(s256(verifier), code.codeChallenge)) throw new OAuthError('invalid_grant', 'PKCE verification failed');
-    }
+    checkCodeProof(client, code, body);
     // The consent is the source of truth: a code from an earlier consent gets no more than the current one.
     return repo.transaction(async () => {
       const grant = await repo.lockGrantOf(client.id, code.userId);
       if (!grant) throw new OAuthError('invalid_grant', 'The person revoked this app’s access');
       if (grant.resource !== code.resource) throw new OAuthError('invalid_grant', 'The person connected this app again since; use the newer code');
-      return issueTokens(grant, allowedBy(grant, code.scopes), code.issuedVia, client.name);
+      const tokens = await issueTokens(grant, allowedBy(grant, code.scopes), code.issuedVia, client.name);
+      await repo.recordRedeemedCode(codeHash, code, now);
+      return tokens;
     });
   }
   if (body.grant_type === 'refresh_token') {

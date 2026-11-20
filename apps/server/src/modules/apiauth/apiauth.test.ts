@@ -128,6 +128,49 @@ it('an authorization code works once and only with its PKCE verifier; a refresh 
   }
 });
 
+it('an app repeating its code request because the response was lost keeps its consent and gets a working pair', async () => {
+  const app = await authorizeApp(alice.id);
+  const lost = await exchange({ grant_type: 'authorization_code', client_id: app.clientId, code: app.code, code_verifier: app.verifier });
+  const retry = await exchange({ grant_type: 'authorization_code', client_id: app.clientId, code: app.code, code_verifier: app.verifier });
+  expect(await refusal(retry.access_token)).toBeNull();
+  const next = await exchange({ grant_type: 'refresh_token', client_id: app.clientId, refresh_token: retry.refresh_token });
+  expect(await refusal(next.access_token)).toBeNull();
+  expect(lost.access_token).not.toBe(retry.access_token);
+});
+
+it('a code shown again with its verifier after the retry window, or after the app already refreshed, ends the app’s access', async () => {
+  const late = await authorizeApp(alice.id);
+  const issued = await exchange({ grant_type: 'authorization_code', client_id: late.clientId, code: late.code, code_verifier: late.verifier });
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + REFRESH_RETRY_WINDOW_MS + 1000 });
+  try {
+    await expect(exchange({ grant_type: 'authorization_code', client_id: late.clientId, code: late.code, code_verifier: late.verifier })).rejects.toMatchObject({ error: 'invalid_grant' });
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(await refusal(issued.access_token)).toEqual({ status: 401, code: 'invalid_token' });
+
+  const moved = await authorizeApp(alice.id);
+  const first = await exchange({ grant_type: 'authorization_code', client_id: moved.clientId, code: moved.code, code_verifier: moved.verifier });
+  const second = await exchange({ grant_type: 'refresh_token', client_id: moved.clientId, refresh_token: first.refresh_token });
+  await expect(exchange({ grant_type: 'authorization_code', client_id: moved.clientId, code: moved.code, code_verifier: moved.verifier })).rejects.toMatchObject({ error: 'invalid_grant' });
+  expect(await refusal(second.access_token)).toEqual({ status: 401, code: 'invalid_token' });
+});
+
+it('someone who only learned a code, another app or without its verifier, cannot end the access of the app it was issued to', async () => {
+  const app = await authorizeApp(alice.id);
+  const issued = await exchange({ grant_type: 'authorization_code', client_id: app.clientId, code: app.code, code_verifier: app.verifier });
+  const other = await authorizeApp(alice.id);
+  await expect(exchange({ grant_type: 'authorization_code', client_id: other.clientId, code: app.code, code_verifier: app.verifier })).rejects.toMatchObject({ error: 'invalid_grant' });
+  // Nor can someone who only learned the code (no verifier) end it, even after the retry window.
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + REFRESH_RETRY_WINDOW_MS + 1000 });
+  try {
+    await expect(exchange({ grant_type: 'authorization_code', client_id: app.clientId, code: app.code, code_verifier: randomBytes(32).toString('base64url') })).rejects.toMatchObject({ error: 'invalid_grant' });
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(await refusal(issued.access_token)).toBeNull();
+});
+
 it('an app’s own refreshes sent at once with the same refresh token (parallel calls, or a retry after a lost response) keep it connected', async () => {
   const app = await authorizeApp(alice.id);
   const first = await exchange({ grant_type: 'authorization_code', client_id: app.clientId, code: app.code, code_verifier: app.verifier });
