@@ -103,6 +103,8 @@ export interface StorePersistence {
 
 /** At most one device-copy save per this many ms while changes keep coming. */
 const PERSIST_EVERY_MS = 800;
+/** How long opening the device copy may take before the board connects without it. */
+const PERSIST_LOAD_TIMEOUT_MS = 3000;
 
 /**
  * Ops kept with the device copy while they wait (FAC-8): reveals only. A reveal that never reaches
@@ -242,15 +244,28 @@ export class BoardStore {
       // server; the first sync then sends what was changed offline and receives what others did.
       if (opts.persist) {
         const persist = opts.persist;
+        // A device store that is slow (a hung IndexedDB open) must not hold the connection back: after
+        // PERSIST_LOAD_TIMEOUT_MS the board connects without waiting. If the copy arrives later it is
+        // merged (a CRDT merge is safe at any time) and kept up to date as usual; one that never
+        // arrives leaves the board without a device copy.
+        let connected = false;
+        const connectOnce = () => {
+          if (connected || this.destroyed) return;
+          connected = true;
+          connectSoon();
+        };
+        const giveUp = setTimeout(connectOnce, PERSIST_LOAD_TIMEOUT_MS);
         void persist
           .load()
           .catch(() => null)
           .then((copy) => {
+            clearTimeout(giveUp);
             if (this.destroyed) return;
             if (copy) this.restore(copy, persist);
             this.persist = persist;
             this.doc.on('update', () => this.schedulePersist());
-            connectSoon();
+            if (connected) this.schedulePersist(); // edits made while waiting are kept too
+            connectOnce();
           });
       } else connectSoon();
       this.awareness = provider.awareness;

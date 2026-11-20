@@ -204,6 +204,8 @@ export function memoryBackend(): VaultBackend & { raw: Map<string, unknown> } {
   };
 }
 
+const OPEN_TIMEOUT_MS = 5000;
+
 /** The browser's IndexedDB (one object store), or null where there is none (private modes may refuse it). */
 export function indexedDbBackend(name = 'freero-offline'): VaultBackend | null {
   if (typeof indexedDB === 'undefined') return null;
@@ -211,10 +213,26 @@ export function indexedDbBackend(name = 'freero-offline'): VaultBackend | null {
   let opened: Promise<IDBDatabase> | null = null;
   const db = () =>
     (opened ??= new Promise<IDBDatabase>((resolve, reject) => {
+      let settled = false;
       const req = indexedDB.open(name, 1);
+      const fail = (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      };
+      // A browser that never answers (a stuck profile) must not leave every caller waiting.
+      const timer = setTimeout(() => fail(new Error('IndexedDB open timed out')), OPEN_TIMEOUT_MS);
       req.onupgradeneeded = () => req.result.createObjectStore(STORE);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        // Already given up on: nobody holds this connection, so close it instead of leaking it.
+        if (settled) return req.result.close();
+        settled = true;
+        clearTimeout(timer);
+        resolve(req.result);
+      };
+      req.onerror = () => fail(req.error);
+      req.onblocked = () => fail(new Error('IndexedDB open is blocked'));
     }).catch((err) => {
       opened = null;
       throw err;

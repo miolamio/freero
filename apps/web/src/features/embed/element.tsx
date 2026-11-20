@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState, useSyncExternalStore, type MouseEvent, type PointerEvent } from 'react';
 import { ExternalLink, Globe, Link as LinkIcon, Maximize2, MousePointerClick, Play, X } from 'lucide-react';
 import type { EmbedElement } from '@freero/shared';
-import { defineElement, useEditor, useIsExporting, type Editor, type ElementRenderProps, type NewElement } from '@engine';
+import { defineElement, isSafeHref, useEditor, useIsExporting, type Editor, type ElementRenderProps, type NewElement } from '@engine';
 import { asLink, displayHost, liveEmbed, safeImageSrc, type LiveEmbed } from './lib/providers';
 import { CARD_H_TEXT, CARD_W, fillPreview, isFetching, sizeFor, subscribeFetching } from './lib/preview';
 import { t } from './messages';
@@ -45,7 +45,7 @@ function LiveFrame({ el, live, selected, onClose }: { el: EmbedElement; live: Li
         </button>
         <a
           className="fr-embed__strip-btn"
-          href={el.url}
+          href={isSafeHref(el.url) ? el.url : undefined}
           target="_blank"
           rel="noopener noreferrer nofollow"
           data-fr-interactive=""
@@ -156,7 +156,7 @@ const EmbedView = memo(function EmbedView({ element: el, selected }: ElementRend
           {!exporting && (
             <a
               className="fr-embed__open"
-              href={el.url}
+              href={isSafeHref(el.url) ? el.url : undefined}
               target="_blank"
               rel="noopener noreferrer nofollow"
               data-fr-interactive=""
