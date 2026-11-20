@@ -17,7 +17,7 @@ import { auditOwnAccount } from './service';
 import type { ProviderClaims } from './oidc';
 import * as repo from './repo';
 import { signupRefusal } from './signups';
-import { emailVerified, endSessionsOf, insertAccount, markEmailVerified, normalizeEmail, validEmail } from './service';
+import { claimVouchedAddress, emailVerified, endSessionsOf, insertAccount, markEmailVerified, normalizeEmail, validEmail } from './service';
 
 export function providerConfig(id: string): OidcProviderConfig | null {
   return getConfig().oidcProviders.find((p) => p.id === id) ?? null;
@@ -38,19 +38,6 @@ export function providerLabel(id: string): string {
 
 export function toLinkedIdentity(i: repo.IdentityRecord): LinkedIdentity {
   return { id: i.id, provider: i.provider, providerLabel: providerLabel(i.provider), email: i.email, createdAt: i.createdAt, lastUsedAt: i.lastUsedAt };
-}
-
-/**
- * An authority (a provider that vouches for the address, a workspace's directory at its verified
- * domain) says `email` is the person's, and the account using it never proved it: it may have been
- * registered by someone else. Before it is handed to anyone, what its creator set up stops working
- * (password, two-step verification, provider sign-ins, pending links, sessions) and the address
- * counts as verified. A no-op for an account whose address was verified.
- */
-async function claimVouchedAddress(userId: string, email: string): Promise<void> {
-  if (!(await repo.claimUnverifiedAccount(userId, email, Date.now()))) return;
-  await endSessionsOf(userId);
-  await emailVerified(userId, email);
 }
 
 const linkOf = (provider: string, c: ProviderClaims, email: string | null): repo.PendingLink => ({

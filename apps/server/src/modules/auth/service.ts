@@ -263,6 +263,19 @@ export async function emailVerified(userId: string, email: string): Promise<void
   }
 }
 
+/**
+ * An authority (a provider that vouches for the address, a workspace's directory at its verified
+ * domain) says `email` is the person's, and the account using it never proved it: it may have been
+ * registered by someone else. Before it is handed to anyone, what its creator set up stops working
+ * (password, two-step verification, provider sign-ins, pending links, sessions) and the address
+ * counts as verified. Also what a password-reset link does first (emails.ts). A no-op for an account whose address was verified.
+ */
+export async function claimVouchedAddress(userId: string, email: string): Promise<void> {
+  if (!(await repo.claimUnverifiedAccount(userId, email, Date.now()))) return;
+  await endSessionsOf(userId);
+  await emailVerified(userId, email);
+}
+
 // ---- Sessions (the cookie has one writer: this module) ----
 
 const sessionEndListeners = new Set<(sessionKey: string) => void>();

@@ -13,6 +13,7 @@ import { auditOwnAccount } from './service';
 import { hashPassword } from './password';
 import * as repo from './repo';
 import {
+  claimVouchedAddress,
   confirmPassword,
   emailVerified,
   endSessionsOf,
@@ -116,6 +117,9 @@ export async function resetPassword(req: Request | null, tokenIn: unknown, passw
   const token = typeof tokenIn === 'string' ? tokenIn : '';
   const t = token ? await repo.takeToken(hashToken(token), 'reset_password', Date.now()) : null;
   if (!t) throw invalidLink();
+  // An account that never proved its address may have been registered by someone else: what they
+  // set up (their password, two-step verification, provider sign-ins) goes first (service.claimVouchedAddress).
+  await claimVouchedAddress(t.userId, t.email);
   // The mailbox, not the old password, chose it: it can't start a two-step recovery (recovery.ts).
   await repo.setPasswordHash(t.userId, await hashPassword(password), { viaLink: true });
   await cancelAccountChanges(t.userId);

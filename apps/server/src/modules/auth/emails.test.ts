@@ -82,3 +82,16 @@ it('an email change to an address someone took meanwhile fails and keeps the old
   await expect(confirmEmailChange(null, token)).rejects.toMatchObject({ status: 409 });
   expect((await repo.findUserById(user.id))?.email).toBe(from);
 });
+
+// Someone can register an address they don't own and attach their own sign-in to it. The owner's
+// reset link proves the mailbox: it must take that setup away, not just change the password.
+it('a password reset on a never-confirmed account removes the provider sign-in its registrant attached', async () => {
+  const victim = email('victim');
+  const squatter = await createUser({ name: 'Squatter', email: victim, password: 'squatter-password' });
+  await repo.insertIdentity({ id: newToken().slice(0, 20), userId: squatter.id, provider: 'google', issuer: 'https://idp.test', subject: `sub-${victim}`, email: 'squatter@gmail.test', emailVerified: true, createdAt: Date.now() });
+  requestPasswordReset(null, victim);
+  await resetPassword(null, await mailedToken(victim, '/reset-password'), 'victim-password-1');
+
+  expect(await repo.findIdentity('google', 'https://idp.test', `sub-${victim}`)).toBeNull();
+  await expect(checkCredentials(victim, 'victim-password-1')).resolves.toMatchObject({ id: squatter.id, emailVerified: true });
+});
