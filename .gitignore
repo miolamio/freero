@@ -11,3 +11,5 @@ backups/
 # Agent git worktrees (Claude Code isolation)
 .claude/worktrees/
 bench-results/
+# Local scratch files
+.dev/
