@@ -1656,7 +1656,7 @@ admin console of team workspaces; see "Audit log, admin console and workspace
 policies"; its one table, since #65, `workspace_usage_daily`, the daily usage rollup), `activity` (board_activity, board_seen: the activity feed and "changes since your last visit"; see "Activity" below), `ai`
 (ai_workspace_settings, ai_usage, ai_assistant_messages, ai_workflows: AI board actions, the board assistant and its saved workflows
 with a provider the operator or a workspace configures; see "AI" below), `apiauth` (api_tokens,
-oauth_clients, oauth_grants, oauth_codes, api_workspace_settings, api_workspace_credentials:
+oauth_clients, oauth_grants, oauth_codes, oauth_redeemed_codes, api_workspace_settings, api_workspace_credentials:
 credentials that act for a person without their session), `api` (no table: the public REST API
 `/api/v1`; see "Public API and OAuth" below), `embed` (embed_member_tokens: live board views inside AI assistants, `/embed/board`, `/ws/embed/boards`, see "The MCP server"; boards embedded on other sites, `/embed/b`, `/ws/embed/b`, oEmbed, see "Boards embedded on other sites"), `mcp` (no table: the remote MCP server `/mcp`; see
 "The MCP server" below), `objects` (no table: the object registry and the one

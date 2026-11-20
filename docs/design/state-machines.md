@@ -156,11 +156,11 @@ name the regression test that guards them.
 - Where: `apiauth/migrations/202611021000_api_credentials.sql`.
 - States:
   - Grant: **absent** or **present** (one per client and user; a new consent replaces it **in place**, keeping its `id`, `apiauth/repo.ts:350-360`).
-  - Code: **pending** or **redeemed** (deleted). An expired code stays until it is purged.
+  - Code: **pending**, **redeemed** (deleted; once it produced tokens it is also kept in `oauth_redeemed_codes`, with when it was redeemed, until its `expires_at`) or **expired** (stays until purged).
   - Refresh token: **fresh** (`used_at` null), **used** (`used_at` set; kept until `expires_at` so a replay can be detected), **deleted** (with its grant).
   - Access token: valid until `expires_at` or until its grant is deleted.
 - Invariants:
-  - A code works once and only with its PKCE verifier.
+  - A code works once and only with its PKCE verifier. A code that already produced tokens, shown again with its own proof (PKCE verifier, or the secret for a code issued without PKCE) by the app it was issued to: within `REFRESH_RETRY_WINDOW_MS` of the first exchange, and while the app has used no refresh token since, it is a retry and gets a fresh pair (as a retried refresh token does); any other time it ends the consent (RFC 6749 §4.1.2). Without the proof, or from another client, it is a plain refusal that changes nothing.
   - A replayed refresh token ends the whole grant.
   - **Expected but not held (ID-3):** tokens never carry more than the current grant allows.
   - **Expected but not held (ID-2):** an app's own retried or concurrent refresh doesn't end its consent.
@@ -169,6 +169,8 @@ name the regression test that guards them.
   |---|---|---|---|
   | grant absent/present → present, plus a pending code | consent "Allow" | none (upsert keeps the grant id and old tokens) | `apiauth/oauth.ts:305-333` |
   | code pending → redeemed, and tokens issued | token endpoint, authorization_code | code deleted first (single use); then client, expiry, redirect and PKCE checked; grant must exist | `apiauth/oauth.ts:390-405`, `apiauth/repo.ts:416` |
+  | tokens issued again, grant kept | a redeemed code shown again within the retry window | same client, correct proof, no refresh token used since the first exchange | `apiauth/oauth.ts` `reusedCode` |
+  | grant present → absent | a redeemed code shown again after the window, or after the app refreshed | same client, correct proof | `apiauth/oauth.ts` `reusedCode` |
   | refresh fresh → used, and a new pair issued | token endpoint, refresh_token | `UPDATE … WHERE used_at IS NULL` | `apiauth/oauth.ts:406-431`, `apiauth/repo.ts:174-182` |
   | refresh used → grant deleted (all tokens cascade) | the same refresh token again | it is a refresh token of this client | `apiauth/oauth.ts:409-416` |
   | grant present → absent | the person revokes the app, "disconnect everything", signed out everywhere, client deleted | none | `apiauth/oauth.ts:459-464`, `apiauth/repo.ts:197-205` |
@@ -764,6 +766,10 @@ Steps (rooms.ts:1607-1654):
 After that, the joined socket's `access/ownAccess/role/readRole/limits/participant/guestGrant` fields (rooms.ts:241-300) are re-derived by `refreshAccess` (rooms.ts:1362-1397) and `setEffective` (rooms.ts:813-844).
 
 Terminal: closed with 4401 (session ended, rooms.ts:1335 / 1692), 4403 (access revoked, rooms.ts:1388; or board deleted, rooms.ts:1642, 2157), `WS_CLOSE_BOARD_REMOVED`, 1009 (too large, rooms.ts:1256 / 1617), 1011 (load failed, rooms.ts:1649).
+
+Per-socket limits (rooms.ts `receive`, `onMessage`, `onUpdate`; route `maxPayload` in platform/ws.ts): a frame over the route's `maxPayload` (16 MiB boards and assistant views, 2 MiB public embeds, 64 KiB notifications) ends the socket in `ws`; before `authorize` answers only 256 KiB is queued; a socket without edit rights closes with 1009 over 2 MiB per message; sync step 1 is answered at most 20 times in a burst, then 0.5/s; a commenter's update rate over 100 burst / 10 per second closes the socket with 4429 (the client backs off, reconnects and its sync step 2 re-sends what was lost); a socket with over 64 MiB unsent is terminated. Each user's commenter writes are bounded by `COMMENT_LIMITS` (commentRules.ts). Yjs client ids are owned per room (`clientOwners`): a non-editor update under another user's id is dropped; ids are claimed only by accepted updates and awareness, and only when new to the room.
+
+Unload: a private layer is deleted when its owner has no place on the board once workspace blocks are ignored (`keepsPlaceOn`); a block (deactivated, two-step, IP allowlist, key) never deletes drafts.
 
 Invariants:
 
