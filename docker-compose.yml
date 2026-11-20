@@ -1,12 +1,17 @@
 # A full production-like Freero stack on one machine:
 #   proxy (Caddy, :8080) -> app x2 -> postgres 17, redis 7, minio (S3), mailpit (SMTP)
 #
+#   Once: put the two required secrets in a .env file next to this one (compose reads it for every
+#   command, including down and logs; without them compose refuses to run at all):
+#     printf 'SESSION_SECRET=%s\nMETRICS_TOKEN=%s\n' "$(openssl rand -base64 48)" "$(openssl rand -hex 24)" > .env
+#   Keep the same values across restarts.
+#
 #   docker compose up --build -d      then open http://localhost:8080
 #   (port taken? FREERO_HTTP_PORT=8580 docker compose up --build -d)
 #   docker compose down -v            stop and delete all data
 #
 # Mailpit UI: http://localhost:8025 · MinIO console: http://localhost:9001 (freero / freero-minio-secret)
-# The secrets below are for this local stack only. Production: docs/deployment.md.
+# The database and MinIO passwords below are for this local stack only. Production: docs/deployment.md.
 name: freero
 
 x-app-env: &app-env
@@ -22,9 +27,9 @@ x-app-env: &app-env
   S3_SECRET_ACCESS_KEY: freero-minio-secret
   SMTP_URL: smtp://mailpit:1025
   MAIL_FROM: Freero <no-reply@freero.local>
-  SESSION_SECRET: ${SESSION_SECRET:-local-compose-only-session-secret-0123456789abcdef}
+  SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET (openssl rand -base64 48), in the environment or in .env next to this file}
   TRUST_PROXY: "1"
-  METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-token}
+  METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN (openssl rand -hex 24), in the environment or in .env next to this file}
   LOG_LEVEL: info
   SHUTDOWN_DRAIN_SECONDS: "2"
 

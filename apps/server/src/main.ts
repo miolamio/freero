@@ -96,13 +96,23 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     log(`${signal}: shutting down`);
-    await drain(config);
-    sockets.close();
-    server.close();
-    await ctx.shutdown(); // realtime saves every loaded doc here
-    await stopPlatform();
-    await closeDb(); // only after everything that writes has finished
-    process.exit(0);
+    // One failing step must not skip the rest (the database closes last, and the process always exits).
+    let failed = false;
+    const step = async (what: string, fn: () => unknown) => {
+      try {
+        await fn();
+      } catch (err) {
+        failed = true;
+        logError(`shutdown: ${what} failed`, err);
+      }
+    };
+    await step('drain', () => drain(config));
+    await step('closing sockets', () => sockets.close());
+    await step('closing the http server', () => server.close());
+    await step('module shutdown', () => ctx.shutdown()); // realtime saves every loaded doc here
+    await step('platform stop', () => stopPlatform());
+    await step('closing the database', () => closeDb()); // only after everything that writes has finished
+    process.exit(failed ? 1 : 0);
   };
   process.on('SIGINT', () => void stop('SIGINT'));
   process.on('SIGTERM', () => void stop('SIGTERM'));

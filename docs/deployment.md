@@ -54,6 +54,9 @@ in front of two app replicas, Postgres 17, Redis 7, MinIO (bucket created and ve
 `minio-init`) and Mailpit.
 
 ```bash
+# SESSION_SECRET and METRICS_TOKEN have no defaults: every compose command (up, down, logs)
+# refuses to run without them. Once, in a .env file next to docker-compose.yml (compose reads it):
+printf 'SESSION_SECRET=%s\nMETRICS_TOKEN=%s\n' "$(openssl rand -base64 48)" "$(openssl rand -hex 24)" > .env
 docker compose up --build -d
 open http://localhost:8080          # sign up, create a board
 docker compose logs -f app          # JSON logs of both replicas
@@ -63,8 +66,8 @@ docker compose down                 # stop (add -v to delete all data)
 For a real server:
 
 1. Point a DNS name at the VM.
-2. Replace the secrets in the `x-app-env` block (or put them in `.env` next to the compose file):
-   `SESSION_SECRET`, `METRICS_TOKEN`, the Postgres and MinIO passwords, and set
+2. Set `SESSION_SECRET` and `METRICS_TOKEN` (required; in `.env` next to the compose file), replace
+   the Postgres and MinIO passwords in the `x-app-env` block, and set
    `PUBLIC_URL=https://your.domain`. An internal instance usually sets `SITE=false` too: `/` then
    opens the app instead of Freero's marketing pages, and search engines are asked to stay away
    ([configuration.md](configuration.md#marketing-site)).

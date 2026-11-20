@@ -38,6 +38,7 @@ Production:
 
 ```bash
 npm run build && npm start     # serves the built web app and the marketing site (apps/site) on :4000
+printf 'SESSION_SECRET=%s\nMETRICS_TOKEN=%s\n' "$(openssl rand -base64 48)" "$(openssl rand -hex 24)" > .env   # once
 docker compose up --build -d   # or the full stack: proxy, 2 app replicas, Postgres, Redis, MinIO, Mailpit on :8080
 ```
 

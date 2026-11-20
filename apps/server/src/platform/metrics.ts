@@ -1,5 +1,6 @@
 // Prometheus metrics. Platform owns the registry and the HTTP/WebSocket metrics; modules add their
 // own through the helpers below (e.g. realtime's loaded docs and persist latency).
+import { createHash, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { RequestHandler } from 'express';
 import client from 'prom-client';
@@ -61,6 +62,12 @@ export function counter<L extends string>(name: string, help: string, labelNames
   return new client.Counter({ name, help, labelNames, registers: [registry] });
 }
 
+/** Whether the request carries `Authorization: Bearer <token>` (compared as digests, in constant time). */
+function bearerMatches(header: string | undefined, token: string): boolean {
+  const digest = (v: string) => createHash('sha256').update(v).digest();
+  return timingSafeEqual(digest(header ?? ''), digest(`Bearer ${token}`));
+}
+
 async function render(res: http.ServerResponse): Promise<void> {
   res.setHeader('Content-Type', registry.contentType);
   res.setHeader('Cache-Control', 'no-store');
@@ -75,7 +82,7 @@ export function metricsRoute(config: Config): RequestHandler {
   return (req, res, next) => {
     if (req.method !== 'GET' || req.path !== '/metrics') return next();
     if (config.metricsPort !== null || (config.production && !config.metricsToken)) return next();
-    if (config.metricsToken && req.headers.authorization !== `Bearer ${config.metricsToken}`) {
+    if (config.metricsToken && !bearerMatches(req.headers.authorization, config.metricsToken)) {
       res.status(401).json({ error: 'metrics token required' });
       return;
     }
@@ -91,7 +98,7 @@ export function startMetricsServer(config: Config): http.Server | null {
       res.statusCode = 404;
       return res.end();
     }
-    if (config.metricsToken && req.headers.authorization !== `Bearer ${config.metricsToken}`) {
+    if (config.metricsToken && !bearerMatches(req.headers.authorization, config.metricsToken)) {
       res.statusCode = 401;
       return res.end();
     }
