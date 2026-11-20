@@ -38,7 +38,7 @@ import {
   type DownloadVia,
 } from './service';
 
-export { createBoard, deleteBoardRowsInWorkspace, cleanUpDeletedBoards } from './service';
+export { createBoard, deleteBoardRowsInWorkspace, cleanUpDeletedBoards, keepsPlaceOn } from './service';
 
 /**
  * #149: a token for the board's room on the operator's media server, for someone who can open the

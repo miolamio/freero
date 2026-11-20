@@ -15,7 +15,14 @@ export interface WsRoute {
   prefix: string;
   /** Called with an accepted socket. Close it with an application code (4xxx) to refuse. */
   handle(ws: WebSocket, req: IncomingMessage): void;
+  /**
+   * Largest message a client of this route may send, in bytes. Enforced while the frame is being
+   * read, so it is also the most an unauthenticated socket can make the server buffer. Default 64 MiB.
+   */
+  maxPayload?: number;
 }
+
+const DEFAULT_MAX_PAYLOAD = 64 * 1024 * 1024;
 
 const HEARTBEAT_MS = 30_000;
 
@@ -39,7 +46,15 @@ function asExpressRequest(app: Express, req: IncomingMessage): Request {
  * cross-site WebSocket hijacking) and the per-IP `wsConnect` rate limit (429 + Retry-After).
  */
 export function attachWebSockets(server: Server, routes: WsRoute[], opts?: { app: Express; config: Config }): { close(): void } {
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
+  // One server per payload limit (the limit belongs to the server in `ws`).
+  const servers = new Map<number, WebSocketServer>();
+  const serverFor = (route: WsRoute): WebSocketServer => {
+    const maxPayload = route.maxPayload ?? DEFAULT_MAX_PAYLOAD;
+    let wss = servers.get(maxPayload);
+    if (!wss) servers.set(maxPayload, (wss = new WebSocketServer({ noServer: true, maxPayload })));
+    return wss;
+  };
+  const clients = () => [...servers.values()].flatMap((w) => [...w.clients]);
   const alive = new WeakMap<WebSocket, boolean>();
   // Longest prefix first so more specific routes win.
   const sorted = [...routes].sort((a, b) => b.prefix.length - a.prefix.length);
@@ -61,7 +76,7 @@ export function attachWebSockets(server: Server, routes: WsRoute[], opts?: { app
         if (!limit.allowed) return refuse(socket, '429 Too Many Requests', `Retry-After: ${limit.retryAfter}\r\n`);
       }
       if (socket.destroyed) return;
-      wss.handleUpgrade(req, socket, head, (ws) => {
+      serverFor(route).handleUpgrade(req, socket, head, (ws) => {
         alive.set(ws, true);
         ws.on('pong', () => alive.set(ws, true));
         wsConnections.inc({ route: route.prefix });
@@ -76,7 +91,7 @@ export function attachWebSockets(server: Server, routes: WsRoute[], opts?: { app
 
   // Ping every client; terminate those that did not answer the previous ping.
   const timer = setInterval(() => {
-    for (const ws of wss.clients) {
+    for (const ws of clients()) {
       if (!alive.get(ws)) {
         ws.terminate();
         continue;
@@ -94,8 +109,8 @@ export function attachWebSockets(server: Server, routes: WsRoute[], opts?: { app
   return {
     close() {
       clearInterval(timer);
-      for (const ws of wss.clients) ws.terminate();
-      wss.close();
+      for (const ws of clients()) ws.terminate();
+      for (const w of servers.values()) w.close();
     },
   };
 }

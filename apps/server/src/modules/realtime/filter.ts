@@ -9,7 +9,7 @@
 //                   (votingRules.ts, estimationRules.ts)
 import * as Y from 'yjs';
 import { COMMENTER_WRITABLE, PARTICIPANT_WRITABLE, type Role } from '@freero/shared';
-import { commenterMayChangeComments, type KeyChange } from './commentRules';
+import { COMMENT_LIMITS, commenterMayChangeComments, type KeyChange } from './commentRules';
 
 export type UpdateDecision = 'apply' | 'drop';
 
@@ -46,6 +46,7 @@ export function commenterMayApply(
   layered?: Y.Map<unknown>,
   extraRoots: ReadonlySet<string> = NONE,
 ): boolean {
+  if (update.byteLength > COMMENT_LIMITS.maxUpdateBytes) return false;
   const names = new Set<string | null>();
   const scratch = new Y.Doc();
   const changedKeys = new Set<string>();

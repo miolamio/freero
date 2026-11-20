@@ -323,11 +323,14 @@ export async function describeAccess(
   userId: string,
   /** #159: as if the workspace's key were usable (to tell that apart from no access at all). */
   ignoreKeyBlock = false,
+  /** As if no workspace block applied (deactivated, two-step required, IP allowlist, key): what the person's place on the board is, apart from a pause. */
+  ignoreBlocks = false,
 ): Promise<{ role: Role | null; access: BoardWorkspaceAccess; needsPassword: boolean; coOwner: boolean; guestEdit?: boolean }> {
   const unlocked = linkLocked(board) && userId !== board.ownerId ? (await repo.unlocksOf(userId, [board.id])).get(board.id) : undefined;
   const seen = linkAsSeenBy(board, unlocked);
   if (isGuestId(userId)) {
-    const [guest, access] = await Promise.all([getGuests([userId]), boardAccess(userId, board)]);
+    const [guest, loaded] = await Promise.all([getGuests([userId]), boardAccess(userId, board)]);
+    const access = ignoreBlocks ? { ...loaded, blocked: null } : loaded;
     const joined = guest.get(userId)?.boardId === board.id;
     const role = joined ? resolveGuestRole(seen, access) : null;
     return {
@@ -340,11 +343,23 @@ export async function describeAccess(
     };
   }
   const [membership, loaded] = await Promise.all([getMembership(board.id, userId), boardAccess(userId, board)]);
-  const access = ignoreKeyBlock && loaded.blocked === 'key_unavailable' ? { ...loaded, blocked: null } : loaded;
+  const access = ignoreBlocks || (ignoreKeyBlock && loaded.blocked === 'key_unavailable') ? { ...loaded, blocked: null } : loaded;
   const memberRole = membership?.role ?? null;
   const role = resolveRole(seen, userId, memberRole, access);
   const needsPassword = role === null && seen !== board && resolveRole(board, userId, memberRole, access) !== null;
   return { role, access, needsPassword, coOwner: role !== null && resolveCoOwner(board, userId, membership, access) };
+}
+
+/**
+ * Whether `userId` still has a place on the board, blocks aside: a membership, the workspace's team
+ * access, the link. A workspace block (deactivated, two-step verification required, an IP
+ * allowlist, an unusable key) is not a loss of it — it ends, and what the person keeps for
+ * themself on the board (private drafts) must outlive it. A trashed or taken-down board counts as
+ * existing (both are undone); only one that is gone for good does not.
+ */
+export async function keepsPlaceOn(boardId: string, userId: string): Promise<boolean> {
+  const board = await repo.getBoardAnyState(boardId);
+  return !!board && (await describeAccess(board, userId, false, true)).role !== null;
 }
 
 /** #97: would a guest joining this board by its link edit it (guestEdits, before any password)? */

@@ -274,11 +274,17 @@ export interface TokenBucket {
   at: number;
 }
 
-export const newBucket = (now: number): TokenBucket => ({ tokens: GUEST_EDIT_LIMITS.updateBurst, at: now });
+export interface Rate {
+  perSecond: number;
+  burst: number;
+}
+const GUEST_RATE: Rate = { perSecond: GUEST_EDIT_LIMITS.updatesPerSecond, burst: GUEST_EDIT_LIMITS.updateBurst };
 
-/** Takes one token for an update; false when the socket is past its rate. */
-export function takeToken(b: TokenBucket, now: number): boolean {
-  b.tokens = Math.min(GUEST_EDIT_LIMITS.updateBurst, b.tokens + ((now - b.at) / 1000) * GUEST_EDIT_LIMITS.updatesPerSecond);
+export const newBucket = (now: number, rate: Rate = GUEST_RATE): TokenBucket => ({ tokens: rate.burst, at: now });
+
+/** Takes one token for an update; false when the socket is past its rate (a guest editor's unless `rate` says otherwise). */
+export function takeToken(b: TokenBucket, now: number, rate: Rate = GUEST_RATE): boolean {
+  b.tokens = Math.min(rate.burst, b.tokens + ((now - b.at) / 1000) * rate.perSecond);
   b.at = now;
   if (b.tokens < 1) return false;
   b.tokens -= 1;

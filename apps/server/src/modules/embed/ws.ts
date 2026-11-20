@@ -60,6 +60,8 @@ export default function embedWs(ctx: ServerContext): WsRoute[] {
 function assistantView(): WsRoute {
   return {
     prefix: PREFIX,
+    // An assistant's live view: a person's own role, editing included (same bound as a board socket).
+    maxPayload: 16 * 1024 * 1024,
     handle(ws, req) {
       const token = embedTokenOf(req);
       let boardId = '';
@@ -131,6 +133,9 @@ function takeVisitorSeat(ws: WebSocket, boardId: string, max: number): boolean {
 function publicEmbed(ctx: ServerContext): WsRoute {
   return {
     prefix: PUBLIC_PREFIX,
+    // Anonymous visitors send a sync step 1 and nothing else; a signed-in member edits lightly in a
+    // frame. The most a stranger can make the server buffer: the board's cap for sockets that don't edit.
+    maxPayload: 2 * 1024 * 1024,
     handle(ws, req) {
       const offered = offeredProtocols(req);
       const token = offered.slice(1).find((p) => p.startsWith(MEMBER_TOKEN_PREFIX)) ?? null;

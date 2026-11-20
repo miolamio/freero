@@ -12,11 +12,23 @@ export interface AwarenessIdentity {
   avatarUrl: string | null;
 }
 
+/** Client ids one socket may announce (a tab has one; a few more cover id changes after a clash). */
+export const MAX_AWARENESS_IDS_PER_SOCKET = 8;
+/**
+ * One state, as JSON: a cursor, viewport and name are a few hundred bytes; the selection is the
+ * big part (a select-all of 10k items is ~200 KB, 100k is ~2 MB). Capped like the largest message a
+ * socket without edit rights may send (rooms.ts), so a real selection on a big board still shows;
+ * bigger states are not applied, they would be sent to every socket of every instance.
+ */
+export const MAX_AWARENESS_STATE_CHARS = 2 * 1024 * 1024;
+
 export interface AwarenessContext {
   /** The authenticated user behind the socket; stamped onto every state it publishes. */
   user: AwarenessIdentity;
   /** True when `clientId` is announced over ANOTHER socket of the room (not ours to write). */
   ownedElsewhere(clientId: number): boolean;
+  /** False when `clientId` is new to the socket and it already holds its share (`newInUpdate`: new ids taken earlier in this update). */
+  mayAnnounce?(clientId: number, newInUpdate: number): boolean;
 }
 
 /**
@@ -27,12 +39,19 @@ export interface AwarenessContext {
 export function sanitizeAwarenessUpdate(update: Uint8Array, ctx: AwarenessContext): Uint8Array | null {
   const decoder = decoding.createDecoder(update);
   const len = decoding.readVarUint(decoder);
+  if (len > MAX_AWARENESS_IDS_PER_SOCKET) throw new Error('awareness update with too many entries');
   const kept: Array<{ clientId: number; clock: number; state: string }> = [];
+  let announced = 0;
   for (let i = 0; i < len; i++) {
     const clientId = decoding.readVarUint(decoder);
     const clock = decoding.readVarUint(decoder);
     const raw = decoding.readVarString(decoder);
     if (ctx.ownedElsewhere(clientId)) continue;
+    if (raw.length > MAX_AWARENESS_STATE_CHARS) continue;
+    if (raw !== 'null' && ctx.mayAnnounce) {
+      if (!ctx.mayAnnounce(clientId, announced)) continue;
+      announced++;
+    }
     const state: unknown = JSON.parse(raw);
     if (state === null) {
       kept.push({ clientId, clock, state: 'null' });

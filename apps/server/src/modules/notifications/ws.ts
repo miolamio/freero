@@ -17,6 +17,7 @@ export default function notificationsWs(ctx: ServerContext): WsRoute {
   });
   return {
     prefix: '/ws/notifications',
+    maxPayload: 64 * 1024, // the server pushes; a client sends nothing that matters
     handle(ws, req) {
       const cookie = req.headers.cookie;
       const sessionKey = sessionKeyFromCookieHeader(cookie);

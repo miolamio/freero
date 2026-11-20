@@ -38,6 +38,20 @@ import type {
   CommentTombstone,
 } from '@freero/shared';
 
+/**
+ * How much a commenter (or guest) may put on the board through comments: everything they
+ * write is stored, logged and downloaded by every client. A comment is a few hundred bytes (long
+ * ones a few KB); these leave room for pasted articles and a whole workshop of reactions.
+ */
+export const COMMENT_LIMITS = {
+  /** One record as JSON (a message's text, its attachments' metadata). */
+  maxRecordChars: 32 * 1024,
+  /** Records one user may have written on a board: threads, messages, reactions, statuses, tombstones. */
+  maxRecordsPerUser: 1500,
+  /** One update from a commenter: a few records. (A guest editor's own cap is GUEST_EDIT_LIMITS.maxUpdateBytes, the same.) */
+  maxUpdateBytes: 256 * 1024,
+} as const;
+
 /** One key's value before and after the update (`undefined` = absent). */
 export interface KeyChange {
   key: string;
@@ -178,5 +192,28 @@ export function commenterMayChangeComments(
     }
   }
 
-  return changes.every(allowed);
+  if (!changes.every(allowed)) return false;
+  return withinLimits(changes, userId, prior, priorKeys);
+}
+
+/** The user a record says wrote it (`undefined`: not one of the shapes above). */
+function ownerOf(v: unknown): string | undefined {
+  if (!isRecord(v)) return undefined;
+  const r = v as Obj;
+  const who = v.kind === 'thread' ? r.createdBy : v.kind === 'message' ? r.authorId : v.kind === 'reaction' ? r.userId : r.by;
+  return typeof who === 'string' ? who : undefined;
+}
+
+/** COMMENT_LIMITS: no record too big, and no more new records than the user has room for. */
+function withinLimits(changes: KeyChange[], userId: string, prior: (key: string) => unknown, priorKeys: () => Iterable<string>): boolean {
+  let added = 0;
+  for (const { before, after } of changes) {
+    if (after === undefined) continue;
+    if (JSON.stringify(after).length > COMMENT_LIMITS.maxRecordChars) return false;
+    if (before === undefined && ownerOf(after) === userId) added++;
+  }
+  if (!added) return true;
+  let mine = 0;
+  for (const k of priorKeys()) if (ownerOf(prior(k)) === userId) mine++;
+  return mine + added <= COMMENT_LIMITS.maxRecordsPerUser;
 }

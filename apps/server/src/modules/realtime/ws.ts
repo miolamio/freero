@@ -41,6 +41,9 @@ export default function realtimeWs(ctx: ServerContext): WsRoute[] {
 function objectDocRoute(kind: ObjectKind, PREFIX: string): WsRoute {
   return {
     prefix: PREFIX,
+    // The largest frame a client sends before it is even authorised (rooms.ts MAX_QUEUED_BYTES): an
+    // editor's offline backlog or a big paste fit; 64 MiB did not need to be buffered for a stranger.
+    maxPayload: 16 * 1024 * 1024,
     handle(ws, req) {
       const cookie = req.headers.cookie;
       const accountKey = sessionKeyFromCookieHeader(cookie);

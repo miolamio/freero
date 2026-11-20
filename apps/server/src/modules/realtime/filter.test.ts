@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { COMMENT_LIMITS } from './commentRules';
 import { decideUpdate } from './filter';
 
 // Ana started thread t1 (message m1) on element e1; Ben replied (m2) and reacted to m1.
@@ -217,5 +218,31 @@ describe('decideUpdate', () => {
     // Written as "Dan"; now known only as "Daniel": editing the text keeps the stored name.
     dan.delete('Dan');
     expect(write((c) => c.set('m:t1:d1', mine('Dan', 'edited')))).toBe('apply');
+  });
+
+  it('does not let a commenter store an oversized comment or flood the board with records', () => {
+    const { server, client } = setup();
+    const decide = (who: string, fn: (c: Y.Map<unknown>) => void) => {
+      const fork = new Y.Doc(); // each attempt starts from what the server holds
+      Y.applyUpdate(fork, Y.encodeStateAsUpdate(server));
+      return decideUpdate('commenter', server, edit(fork, fn), who);
+    };
+    const long = 'x'.repeat(COMMENT_LIMITS.maxRecordChars);
+    expect(decide('dan', (c) => c.set('m:t1:d1', msg('d1', 'dan', 'fine'))), 'a normal comment').toBe('apply');
+    expect(decide('dan', (c) => c.set('m:t1:d1', msg('d1', 'dan', long))), 'one huge comment').toBe('drop');
+    // Many records, each within its limit, in one update far over the commenter cap.
+    const records = Math.ceil(COMMENT_LIMITS.maxUpdateBytes / (COMMENT_LIMITS.maxRecordChars - 400)) + 1;
+    expect(
+      decide('dan', (c) => {
+        for (let i = 0; i < records; i++) c.set(`m:t1:b${i}`, msg(`b${i}`, 'dan', 'y'.repeat(COMMENT_LIMITS.maxRecordChars - 400)));
+      }),
+      'one update of megabytes',
+    ).toBe('drop');
+    // A user who already wrote as many records as they may cannot add one more; others still can.
+    for (let i = 0; i < COMMENT_LIMITS.maxRecordsPerUser; i++) client.getMap('comments').set(`m:t1:f${i}`, msg(`f${i}`, 'dan', 'hi'));
+    Y.applyUpdate(server, Y.encodeStateAsUpdate(client, Y.encodeStateVector(server)));
+    expect(decide('dan', (c) => c.set('m:t1:over', msg('over', 'dan', 'one too many'))), 'past the per-user cap').toBe('drop');
+    expect(decide('dan', (c) => c.set('m:t1:f0', { ...msg('f0', 'dan', 'edited'), editedAt: 3 })), 'editing their own is not adding').toBe('apply');
+    expect(decide('eve', (c) => c.set('m:t1:e1', msg('e1', 'eve', 'hello'))), 'someone else is unaffected').toBe('apply');
   });
 });

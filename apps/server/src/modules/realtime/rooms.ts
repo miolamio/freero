@@ -87,6 +87,7 @@ import {
   takeToken,
   touchedRoots,
   type GuestBudget,
+  type Rate,
   type TokenBucket,
 } from './guestEditing';
 import { getConfig } from '../../platform/config';
@@ -95,8 +96,8 @@ import { logError } from '../../platform/log';
 import { currentRequestContext, runWithRequestContext } from '../../platform/requestContext';
 import { isShared, publish, subscribe, subscribedInstances, type Subscription } from '../../platform/pubsub';
 import { getUser, noteSessionActivity } from '../auth/index';
-import { getBoardAccess, touchBoard } from '../boards/index';
-import { sanitizeAwarenessUpdate, withoutClients, type AwarenessIdentity } from './awareness';
+import { getBoardAccess, keepsPlaceOn, touchBoard } from '../boards/index';
+import { MAX_AWARENESS_IDS_PER_SOCKET, sanitizeAwarenessUpdate, withoutClients, type AwarenessIdentity } from './awareness';
 import { cardAssignments, emitCardAssignments, hasCardListeners } from './cards';
 import { elementChanges, ELEMENTS, emitBoardChange, emitDocEdited, hasBoardChangeListeners, requestDoor, socketDoor } from './changes';
 import { commentPeople, COMMENTS_COLLECTION, emitCommentMessages, hasCommentListeners, messageEvents, type CommentLayer, type CommentMessageEvent } from './comments';
@@ -170,6 +171,26 @@ const RESYNC_MIN_INTERVAL_MS = 2000;
 const IDENTITY_TTL_MS = 5000;
 /** Bytes a socket may send before it has joined (auth + doc load); more closes it. */
 const MAX_QUEUED_BYTES = 16 * 1024 * 1024;
+/** …and before its access was even checked. */
+const MAX_UNAUTHORIZED_QUEUED_BYTES = 256 * 1024;
+/**
+ * What one socket may send and be sent. Generous: the largest legitimate messages are an
+ * editor's offline backlog or a big paste (the first is bounded by the route's maxPayload, below),
+ * everything a commenter, viewer or guest sends is a few KB (a comment, a ballot, presence, a
+ * private draft), and an initial sync is one message from the server.
+ */
+/** Largest message a socket without edit rights may send (the guests' update cap is 256 KB; layer drafts and pastes need more). */
+const MAX_NON_EDITOR_MESSAGE_BYTES = 2 * 1024 * 1024;
+/** Sync step 1 makes the server encode and send the whole doc: a socket sends one on connect and rarely again. */
+const SYNC_STEP1_RATE: Rate = { perSecond: 0.5, burst: 20 };
+/** A commenter's update is judged against a copy of the doc: typing, reacting and voting stay far below this. */
+const COMMENTER_UPDATE_RATE: Rate = { perSecond: 10, burst: 100 };
+/** A socket that has this much unsent data queued is not reading: closed. The first message of a sync may be bigger, it is only counted once queued. */
+const MAX_OUTGOING_BUFFER_BYTES = 64 * 1024 * 1024;
+/** Client ids a room remembers owners for (a user holds one per tab and per reload); past it, new ids go unclaimed. */
+const MAX_CLIENT_OWNERS = 50_000;
+/** Distinct client ids one non-editor update may write under (a client writes under one; a few after id clashes). */
+const MAX_CLIENT_IDS_PER_UPDATE = 16;
 /** An element removed from one doc this recently is not "added" when it lands in another (a move). */
 const MOVE_WINDOW_MS = 30_000;
 /**
@@ -340,6 +361,9 @@ interface Conn {
   guestGrant: GuestEditGrant | null;
   /** #97: the guest socket's update rate, and when it was last told of each refusal. */
   bucket: TokenBucket | null;
+  /** Sync step 1 requests, and a commenter's updates, by rate. */
+  step1Bucket: TokenBucket | null;
+  commenterBucket: TokenBucket | null;
   noticeAt: Map<GuestEditNoticeCode, number>;
   /**
    * Suggestions this socket accepted after they were rejected (suggestions.ts guardSuggestionWrites),
@@ -418,6 +442,7 @@ function syncUpdateMessage(update: Uint8Array): Uint8Array {
 
 function send(ws: WebSocket, msg: Uint8Array): void {
   if (ws.readyState !== WebSocket.OPEN) return;
+  if (ws.bufferedAmount > MAX_OUTGOING_BUFFER_BYTES) return void ws.terminate();
   ws.send(msg, (err) => {
     if (err) ws.terminate();
   });
@@ -476,6 +501,22 @@ class Room {
   private removedAttribution = new Map<string, { at: number; attribution: Attribution }>();
   /** #97: each guest's adds within the last hour on this board (guestEditing.ts; this instance's). */
   private guestBudgets = new Map<string, GuestBudget>();
+  /**
+   * Yjs client id -> the user it belongs to, for as long as the room is loaded. A struct under a
+   * client id burns that client's clock: let anyone else write one, and the server skips the
+   * owner's next real change as "already there" while the owner's client believes it was saved.
+   * An id is claimed only when this room first sees it (no state in the doc yet): by its first
+   * accepted writer, by the socket that announces it in awareness, or by another instance's
+   * awareness (its `user` is authenticated there). An id the doc already has state for and nobody
+   * claimed (a room reloaded, a server restarted) is NOT claimed by whoever shows up first — that
+   * would lock the real owner out — so writes under it are allowed and unprotected; while its
+   * owner's socket is live here it is still protected through that socket's awareness
+   * (`clientIdTaken`). Open: ids first seen before this instance loaded the room, and an owner
+   * who never announces presence, stay unprotected (no persistence or extra channel is built).
+   * A guest's id may pass to another guest id once the first has no socket here (a session
+   * re-minted in the same tab keeps its Y.Doc id).
+   */
+  private clientOwners = new Map<number, string>();
 
   constructor(readonly id: string) {
     this.awareness = new awarenessProtocol.Awareness(this.doc);
@@ -505,7 +546,10 @@ class Room {
         const conn = origin instanceof WebSocket ? this.conns.get(origin) : undefined;
         if (conn) {
           // `updated`, too: a client id seen before (on another instance, or before a reconnect).
-          for (const id of [...added, ...updated]) conn.awarenessIds.add(id);
+          for (const id of [...added, ...updated]) {
+            conn.awarenessIds.add(id);
+            this.claimIfFresh(id, conn.userId);
+          }
           for (const id of removed) conn.awarenessIds.delete(id);
         }
         const changed = [...added, ...updated, ...removed];
@@ -1020,6 +1064,10 @@ class Room {
 
   /** Every message of a socket goes through here (held while one of its layer ops is pending). */
   private receive(conn: Conn, data: Uint8Array): void {
+    if (data.byteLength > MAX_NON_EDITOR_MESSAGE_BYTES && !canEdit(conn.role)) {
+      conn.ws.close(1009, 'Message too large');
+      return;
+    }
     if (conn.held) conn.held.push(data);
     else this.onMessage(conn, data);
   }
@@ -1125,7 +1173,10 @@ class Room {
       for (const c of this.conns.values()) if (c.awarenessIds.has(id)) return true;
       return false;
     });
-    if (ours) awarenessProtocol.applyAwarenessUpdate(this.awareness, ours, REMOTE_ORIGIN);
+    if (ours) {
+      this.learnOwnersFromPeer(ours);
+      awarenessProtocol.applyAwarenessUpdate(this.awareness, ours, REMOTE_ORIGIN);
+    }
   }
 
   /** Do these state vectors (another instance's doc and layers) cover anything this room lacks? */
@@ -1213,6 +1264,8 @@ class Room {
       guestEdit: a.guestEdit === true,
       guestGrant: null,
       bucket: null,
+      step1Bucket: null,
+      commenterBucket: null,
       noticeAt: new Map(),
       lostAccepts: null,
       offlineWrites: null,
@@ -1253,6 +1306,9 @@ class Room {
         case MESSAGE_SYNC: {
           const syncType = decoding.readVarUint(decoder);
           if (syncType === syncProtocol.messageYjsSyncStep1) {
+            const now = Date.now();
+            conn.step1Bucket ??= newBucket(now, SYNC_STEP1_RATE);
+            if (!takeToken(conn.step1Bucket, now, SYNC_STEP1_RATE)) break; // the answer is the whole doc
             const e = encoding.createEncoder();
             encoding.writeVarUint(e, MESSAGE_SYNC);
             syncProtocol.readSyncStep1(decoder, e, this.doc);
@@ -1267,10 +1323,8 @@ class Room {
           if (conn.visitor) break;
           const update = sanitizeAwarenessUpdate(decoding.readVarUint8Array(decoder), {
             user: this.identityOf(conn),
-            ownedElsewhere: (id) => {
-              for (const c of this.conns.values()) if (c !== conn && c.awarenessIds.has(id)) return true;
-              return false;
-            },
+            ownedElsewhere: (id) => this.clientIdTaken(id, conn),
+            mayAnnounce: (id, fresh) => conn.awarenessIds.has(id) || conn.awarenessIds.size + fresh < MAX_AWARENESS_IDS_PER_SOCKET,
           });
           if (update) awarenessProtocol.applyAwarenessUpdate(this.awareness, update, conn.ws);
           break;
@@ -1337,12 +1391,25 @@ class Room {
     }
     const hidden = this.layers.get(EDITORS_LAYER)?.doc;
     const layered = hidden?.share.has(COMMENTS_COLLECTION) ? hidden.getMap<unknown>(COMMENTS_COLLECTION) : undefined;
+    // Structs under another user's client id are dropped like any update outside the role's rules;
+    // the ids it writes under are claimed once the update is accepted.
+    const claim = this.clientIdsToClaim(conn, update);
     // A guest that may edit (guestEditing.ts): its own content too, judged inside the transaction.
-    if (conn.guestGrant && this.onGuestUpdate(conn, conn.guestGrant, update, layered)) {
+    if (claim && conn.guestGrant && this.onGuestUpdate(conn, conn.guestGrant, update, layered)) {
+      for (const id of claim) this.setOwner(id, conn.userId);
       if (syncType === syncProtocol.messageYjsUpdate) noteSessionActivity(conn.sessionKey);
       return;
     }
-    if (decideUpdate(conn.role, this.doc, update, conn.userId, conn.authorNames, layered, conn.participant) === 'apply') {
+    const now = Date.now();
+    conn.commenterBucket ??= newBucket(now, COMMENTER_UPDATE_RATE);
+    if (!conn.guestGrant && !takeToken(conn.commenterBucket, now, COMMENTER_UPDATE_RATE)) {
+      // Not silently: the client would believe the change saved. Closed with the code its reconnect
+      // logic backs off on; the new socket's sync step 2 carries what the server lacks.
+      conn.ws.close(4429, 'Too many changes');
+      return;
+    }
+    if (claim && decideUpdate(conn.role, this.doc, update, conn.userId, conn.authorNames, layered, conn.participant) === 'apply') {
+      for (const id of claim) this.setOwner(id, conn.userId);
       // A record for a thread that lives in the editors layer (a tab that had not seen it hidden)
       // goes there (elementContent.ts), never to the other sockets of the shared doc.
       const before = Y.encodeStateVector(this.doc);
@@ -1375,6 +1442,70 @@ class Room {
       encoding.writeVarUint(e, MESSAGE_SYNC);
       syncProtocol.writeSyncStep2(e, this.doc);
       send(conn.ws, encoding.toUint8Array(e));
+    }
+  }
+
+  /** Claims `id` for `userId` when it is unowned and this room has no state for it yet. */
+  private claimIfFresh(id: number, userId: string): void {
+    if (!this.clientOwners.has(id) && Y.getState(this.doc.store, id) === 0) this.setOwner(id, userId);
+  }
+
+  private setOwner(id: number, userId: string): void {
+    if (this.clientOwners.has(id) || this.clientOwners.size < MAX_CLIENT_OWNERS) this.clientOwners.set(id, userId);
+  }
+
+  /** `owner` is a guest id with no socket here, and `userId` is another guest: one person's session, re-minted. */
+  private guestHandedOver(owner: string, userId: string): boolean {
+    if (!isGuestId(owner) || !isGuestId(userId)) return false;
+    for (const c of this.conns.values()) if (c.userId === owner) return false;
+    return true;
+  }
+
+  /** `id` is another user's: owned by them here, or announced over another user's live socket. */
+  private clientIdTaken(id: number, conn: Conn): boolean {
+    const owner = this.clientOwners.get(id);
+    if (owner !== undefined) return owner !== conn.userId && !this.guestHandedOver(owner, conn.userId);
+    for (const c of this.conns.values()) if (c !== conn && c.userId !== conn.userId && c.awarenessIds.has(id)) return true;
+    return false;
+  }
+
+  /**
+   * The client ids to claim for the socket's user once `update` is accepted (ids new to the room,
+   * and a guest's re-minted one), or null when the update must be dropped: it carries structs under
+   * another user's id, more distinct ids than any client writes, or cannot be read.
+   */
+  private clientIdsToClaim(conn: Conn, update: Uint8Array): number[] | null {
+    let clients: Set<number>;
+    try {
+      clients = new Set(Y.decodeUpdate(update).structs.map((s) => s.id.client));
+    } catch {
+      return null;
+    }
+    if (clients.size > MAX_CLIENT_IDS_PER_UPDATE) return null;
+    const claim: number[] = [];
+    for (const id of clients) {
+      if (this.clientIdTaken(id, conn)) return null;
+      const owner = this.clientOwners.get(id);
+      if (owner === undefined ? Y.getState(this.doc.store, id) === 0 : owner !== conn.userId) claim.push(id);
+    }
+    return claim;
+  }
+
+  /** What another instance's presence tells about who owns which client id (its `user` is authenticated there). */
+  private learnOwnersFromPeer(update: Uint8Array): void {
+    try {
+      const decoder = decoding.createDecoder(update);
+      const len = decoding.readVarUint(decoder);
+      for (let i = 0; i < len; i++) {
+        const id = decoding.readVarUint(decoder);
+        decoding.readVarUint(decoder);
+        const raw = decoding.readVarString(decoder);
+        if (raw === 'null') continue;
+        const userId = (JSON.parse(raw) as { user?: { id?: unknown } } | null)?.user?.id;
+        if (typeof userId === 'string') this.claimIfFresh(id, userId);
+      }
+    } catch {
+      /* presence that cannot be read teaches nothing */
     }
   }
 
@@ -1775,7 +1906,9 @@ async function unloadRoom(room: Room): Promise<void> {
 
 async function compactLayerChecked(boardId: string, layer: string): Promise<void> {
   const owner = privateLayerOwner(layer);
-  const keep = !owner || (await getBoardAccess(boardId, owner)).role !== null;
+  // A block ending someone's access (deactivated, an IP allowlist: the unload timer even inherits the
+  // address of the request that started it) is not a removal from the board: their drafts stay.
+  const keep = !owner || (await keepsPlaceOn(boardId, owner));
   await layerStore.compactLayer(boardId, layer, keep);
 }
 
@@ -1800,10 +1933,12 @@ export async function admitSocket(
 ): Promise<void> {
   const queue: Uint8Array[] = [];
   let queuedBytes = 0;
+  let authorized = false;
   const hold = (data: WebSocket.RawData) => {
     const bytes = toBytes(data);
     queuedBytes += bytes.byteLength;
-    if (queuedBytes > MAX_QUEUED_BYTES) ws.close(1009, 'Too much data before the board loaded');
+    // Until `authorize` answers, all a client has to say is its sync step 1 and presence.
+    if (queuedBytes > (authorized ? MAX_QUEUED_BYTES : MAX_UNAUTHORIZED_QUEUED_BYTES)) ws.close(1009, 'Too much data before the board loaded');
     else queue.push(bytes);
   };
   ws.on('message', hold);
@@ -1814,8 +1949,9 @@ export async function admitSocket(
   const privacySignal = currentRequestContext()?.privacySignal === true; // and whether it asked not to be tracked
   try {
     let since = accessVersion; // before authorizing: a change from here on makes its answer stale
-    const authorized = await authorize();
-    let a = 'code' in authorized ? authorized : { ...authorized, ip: authorized.ip ?? ip, privacySignal };
+    const answer = await authorize();
+    authorized = true;
+    let a = 'code' in answer ? answer : { ...answer, ip: answer.ip ?? ip, privacySignal };
     if ('code' in a) return ws.close(a.code, a.reason);
     for (let rechecks = 0; ; rechecks++) {
       const room = getRoom(a.boardId);
