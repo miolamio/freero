@@ -7,7 +7,7 @@
 //   editors.json   (owners/editors' backups) the hidden frames' contents, same layout
 //   files/<name>   the uploads the content references, under their stored names
 import { createHash } from 'node:crypto';
-import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from 'fflate';
+import { strFromU8, strToU8, unzipSync, zip, type Zippable } from 'fflate';
 
 export const BACKUP_FORMAT = 'freero.board-backup';
 /**
@@ -57,7 +57,7 @@ export class BackupFormatError extends Error {}
 
 const sha256 = (data: Uint8Array) => createHash('sha256').update(data).digest('hex');
 
-export function buildBackup(input: {
+export async function buildBackup(input: {
   exportedAt: Date;
   origin: string | null;
   board: BackupManifest['board'];
@@ -65,7 +65,7 @@ export function buildBackup(input: {
   editors: ContentJson | null;
   files: Array<{ name: string; data: Uint8Array }>;
   missingFiles: BackupManifest['missingFiles'];
-}): Uint8Array {
+}): Promise<Uint8Array> {
   const entries: Zippable = {};
   const docBytes = strToU8(JSON.stringify(input.doc));
   const editorsBytes = input.editors ? strToU8(JSON.stringify(input.editors)) : null;
@@ -93,7 +93,8 @@ export function buildBackup(input: {
     missingFiles: input.missingFiles,
   };
   entries['freero.json'] = strToU8(JSON.stringify(manifest, null, 2));
-  return zipSync(entries, { level: 6 });
+  // fflate's async zip deflates the JSON entries on worker threads, not on the event loop.
+  return new Promise((resolve, reject) => zip(entries, { level: 6 }, (err, out) => (err ? reject(err) : resolve(out))));
 }
 
 export interface ReadLimits {
@@ -173,6 +174,9 @@ export function readBackup(data: Uint8Array, limits: ReadLimits): BackupContents
   let entries = 0;
   let unpacked = 0;
   let raw: Record<string, Uint8Array>;
+  // Synchronous on purpose: measured, inflating 2 x 128 MB of zeros + 200 MB stored (more than the
+  // limits allow) took ~0.3 s, little next to the JSON.parse that follows; a worker per
+  // crafted entry (fflate's async unzip starts one per big compressed entry) would cost more.
   try {
     raw = unzipSync(data, {
       filter(f) {

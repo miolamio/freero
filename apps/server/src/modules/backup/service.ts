@@ -51,7 +51,7 @@ export async function downloadBackup(boardId: string, userId: string, origin: st
       files.push({ name, data });
     }
   }
-  const data = buildBackup({
+  const data = await buildBackup({
     exportedAt: new Date(),
     origin,
     board: { id: auth.board.id, title: auth.board.title, description: auth.board.description, createdAt: new Date(auth.board.createdAt).toISOString() },

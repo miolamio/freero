@@ -8,7 +8,8 @@ import { badRequest, HttpError, notFound } from '../../platform/http';
 import { readBoardView, type BoardReader } from '../realtime/index';
 import { readUpload } from '../uploads/index';
 import { boardSvg, stickerSrc } from './svg';
-import { pdfOf, rasterize } from './raster';
+import { pixelsOf } from './imageSize';
+import { rasterInWorker } from './rasterJob';
 
 export type RenderFormat = 'png' | 'svg' | 'pdf';
 export const RENDER_FORMATS: readonly RenderFormat[] = ['png', 'svg', 'pdf'];
@@ -22,8 +23,24 @@ export interface RenderSpec {
   fit?: number;
 }
 
-/** Bounds: boards bigger than this are refused (413), pictures bigger than this are drawn smaller. */
-export const RENDER_LIMITS = { maxItems: 5000, maxSide: 8000, maxPixels: 40_000_000, maxImageBytes: 40 * 1024 * 1024, maxScale: 4 } as const;
+/**
+ * Bounds: boards bigger than this are refused (413), pictures bigger than this are drawn smaller.
+ * resvg decodes every <image> with no limit of its own (~10 ms and ~4 bytes of worker memory per
+ * decoded megapixel, measured) and uploads are capped in bytes only (MAX_UPLOAD_MB, 15 by default;
+ * 90 KB of PNG can claim 100 Mpx): when rasterising, one picture may decode to `maxImagePixels`
+ * (50 Mpx: a 48 MP phone photo) and all of them together to `maxBoardImagePixels` (250 Mpx, about
+ * 1 GB and 2.5 s in the worker: twenty 12 MP photos). Past that, the biggest pictures are drawn as
+ * placeholders. A picture whose header can't be read is not counted (resvg fails on it or draws it).
+ */
+export const RENDER_LIMITS = {
+  maxItems: 5000,
+  maxSide: 8000,
+  maxPixels: 40_000_000,
+  maxImageBytes: 40 * 1024 * 1024,
+  maxImagePixels: 50_000_000,
+  maxBoardImagePixels: 250_000_000,
+  maxScale: 4,
+} as const;
 
 const IMAGE_TYPES: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' };
 
@@ -55,28 +72,46 @@ function insideFrame(all: readonly BoardElement[], frame: BoardElement): BoardEl
   });
 }
 
-/** Data URLs of the uploaded pictures these elements show (others are drawn as placeholders), within a byte budget. */
-async function pictures(els: readonly BoardElement[], maxBytes: number = RENDER_LIMITS.maxImageBytes): Promise<Map<string, string>> {
+/**
+ * Data URLs of the uploaded pictures these elements show (others are drawn as placeholders), within
+ * a byte budget and, with `pixelLimits`, a decoded-pixel budget (the smallest pictures are kept).
+ */
+export async function pictures(els: readonly BoardElement[], maxBytes: number = RENDER_LIMITS.maxImageBytes, pixelLimits?: { each: number; total: number }): Promise<Map<string, string>> {
   const srcs = new Set<string>();
   for (const el of els) {
     const src = el.type === 'image' ? (el as { src?: unknown }).src : el.type === 'embed' ? (el as { image?: unknown }).image : stickerSrc(el);
     if (typeof src === 'string' && (src.startsWith('/uploads/') || /^data:image\/(png|jpeg|gif|webp);base64,/.test(src))) srcs.add(src);
   }
-  const out = new Map<string, string>();
+  const found: Array<{ src: string; url: string; pixels: number }> = [];
   let budget: number = maxBytes;
   for (const src of srcs) {
+    let url: string;
+    let size: number;
+    let pixels = 0;
     if (src.startsWith('data:')) {
       if (src.length > budget) continue;
-      budget -= src.length;
-      out.set(src, src);
-      continue;
+      url = src;
+      size = src.length;
+      if (pixelLimits) pixels = pixelsOf(Buffer.from(src.slice(src.indexOf(',') + 1), 'base64')) ?? 0;
+    } else {
+      const type = IMAGE_TYPES[src.split('.').pop()?.toLowerCase() ?? ''];
+      if (!type) continue;
+      const bytes = await readUpload(src).catch(() => null);
+      if (!bytes || bytes.length > budget) continue;
+      url = `data:${type};base64,${bytes.toString('base64')}`;
+      size = bytes.length;
+      if (pixelLimits) pixels = pixelsOf(bytes) ?? 0;
     }
-    const type = IMAGE_TYPES[src.split('.').pop()?.toLowerCase() ?? ''];
-    if (!type) continue;
-    const bytes = await readUpload(src).catch(() => null);
-    if (!bytes || bytes.length > budget) continue;
-    budget -= bytes.length;
-    out.set(src, `data:${type};base64,${bytes.toString('base64')}`);
+    budget -= size;
+    found.push({ src, url, pixels });
+  }
+  const out = new Map<string, string>();
+  let pixelBudget = pixelLimits?.total ?? Infinity;
+  // Smallest first, so what doesn't fit is always the biggest (not whatever came last).
+  for (const p of pixelLimits ? [...found].sort((x, y) => x.pixels - y.pixels) : found) {
+    if (pixelLimits && (p.pixels > pixelLimits.each || p.pixels > pixelBudget)) continue;
+    pixelBudget -= p.pixels;
+    out.set(p.src, p.url);
   }
   return out;
 }
@@ -123,14 +158,15 @@ export async function renderBoard(boardId: string, reader: BoardReader, title: s
   }
   if (els.length > RENDER_LIMITS.maxItems)
     throw new HttpError(413, `This ${spec.frameId ? 'frame' : 'board'} has ${els.length} items; pictures are drawn of at most ${RENDER_LIMITS.maxItems} (export a frame instead)`, 'board_too_large');
-  const images = await pictures(els);
+  const images = await pictures(els, RENDER_LIMITS.maxImageBytes, spec.format === 'svg' ? undefined : { each: RENDER_LIMITS.maxImagePixels, total: RENDER_LIMITS.maxBoardImagePixels });
   const { svg, width, height } = boardSvg({ elements: els, collection: (n) => view.collection(n), imageData: (src) => images.get(src) ?? null, ...(area ? { area } : {}) });
   if (spec.format === 'svg') return { body: Buffer.from(svg), contentType: 'image/svg+xml', extension: 'svg', width, height, scale: 1, items: els.length };
   // As sharp as asked (default 2 pixels per unit for PNG, 1.5 for PDF), never past the pixel budget.
   const want = spec.scale ?? (spec.format === 'png' ? 2 : 1.5);
   const side = Math.min(RENDER_LIMITS.maxSide, spec.fit ?? Infinity);
   const scale = Math.max(0.05, Math.min(want, side / width, side / height, Math.sqrt(RENDER_LIMITS.maxPixels / (width * height))));
-  const r = await rasterize(svg, scale);
-  if (spec.format === 'png') return { body: r.png, contentType: 'image/png', extension: 'png', width: r.width, height: r.height, scale, items: els.length };
-  return { body: pdfOf(r.pixels, r.width, r.height, width * 0.75, height * 0.75, title), contentType: 'application/pdf', extension: 'pdf', width, height, scale, items: els.length };
+  // Off the main thread (rasterJob.ts): drawing and encoding a big picture takes seconds.
+  const r = await rasterInWorker({ svg, scale, ...(spec.format === 'pdf' ? { pdf: { pageW: width * 0.75, pageH: height * 0.75, title } } : {}) });
+  if (spec.format === 'png') return { body: r.body, contentType: 'image/png', extension: 'png', width: r.width, height: r.height, scale, items: els.length };
+  return { body: r.body, contentType: 'application/pdf', extension: 'pdf', width, height, scale, items: els.length };
 }
