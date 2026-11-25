@@ -1460,7 +1460,10 @@ answer 404 and `GET /api/analytics` says `productAnalytics: false`.
   settings name no `posthog` for an account that opted out), and a signed-in person is identified
   by the account's pseudonym (`posthog.distinctId` in the settings), so page and server events are
   one person. The CSP adds PostHog's assets host to `script-src` (its extensions load from there)
-  on the pages Google's tag may run on. `POSTHOG_ERRORS` sends the server's reported errors
+  on the pages Google's tag may run on. `POSTHOG_BROWSER_HOST` sends pages through a reverse
+  proxy on the instance's domain (hosted: PostHog's managed proxy `t.freero.app`, since
+  2026-11-20, so ad blockers don't drop events); the proxy then serves those scripts too, the
+  server keeps `POSTHOG_HOST`, and links open PostHog's app for its region. `POSTHOG_ERRORS` sends the server's reported errors
   (`platform/errorReporting` `onErrorReported`: a 500, a crash) to PostHog error tracking as
   `$exception` (`reportErrorsToPostHog`), under the pseudonym of the account whose request failed. Events are batched
   (20, or every 10 s) and the shutdown hook (`init.ts`) sends what is queued, waiting at most 5 s.
@@ -1506,7 +1509,7 @@ answer 404 and `GET /api/analytics` says `productAnalytics: false`.
   | `share_link_copied` | `access` (what the link allows at that moment, `none` included) | the app: the share dialog's "Copy link" |
   | `share_nudge` | `action` (`shown`, `clicked`) | the app: `features/share-nudge` through `Host.trackProduct` |
   | `get_started` | `step` (`shown`, `dismissed`, `template`, `blank`, `connect_agent`, `invite`) | the app: the dashboard's get-started card (`pages/dashboard/GetStarted.tsx`) |
-  | `$mcp_tool_call`, `$mcp_initialize`, `$mcp_tools_list`, `$mcp_resource_read` … (PostHog MCP analytics, `@posthog/mcp`) | only the allowlist in `analytics/mcpAnalytics.ts`: tool name, argument NAMES, duration, error / error type, listed tool names, client / protocol / server versions, the SDK's hashed session id — never argument values, results, the agent's stated intent, error messages, the user agent or which board (the SDK sends those by default: `beforeSend` cuts every event down); the SDK adds no arguments to the tools (`context`, `conversation_id`, `llm_model` off) and no `$exception` | `mcp/routes.ts` asks `mcpAnalyticsFor(account)` per request (null: no key, privacy signal, opt-out, test address) and `buildServer` instruments the request's server before registering its tools; through the product events' client (same batching and shutdown flush) |
+  | `$mcp_tool_call`, `$mcp_initialize`, `$mcp_tools_list`, `$mcp_resource_read` … (PostHog MCP analytics, `@posthog/mcp`) | only the allowlist in `analytics/mcpAnalytics.ts`: tool name, argument NAMES, duration, error, error type (one of `MCP_FAILURES`, from the failed result's `_meta`) and status, listed tool names, client / protocol / server versions, the SDK's hashed session id — never argument values, results, the agent's stated intent, error messages, the user agent or which board (the SDK sends those by default: `beforeSend` cuts every event down); the SDK adds no arguments to the tools (`context`, `conversation_id`, `llm_model` off) and no `$exception` | `mcp/routes.ts` asks `mcpAnalyticsFor(account)` per request (null: no key, privacy signal, opt-out, test address) and `buildServer` instruments the request's server before registering its tools; through the product events' client (same batching and shutdown flush) |
   Not counted: workspace members added other ways (admin add, SCIM groups, domain capture: no
   single writer; `invite_sent` / `invite_accepted` cover activation), a board's built-in template
   on the server (the app inserts templates through the Editor; the API's templates are saved ones).
